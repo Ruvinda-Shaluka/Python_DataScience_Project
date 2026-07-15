@@ -254,16 +254,20 @@ pay_range_check = df[pay_cols].apply(lambda s: s.between(-2, 9)).all()
 df['avg_bill_amount'] = df[bill_cols].mean(axis=1)
 df['avg_pay_amount'] = df[pay_amt_cols].mean(axis=1)
 
-# 2. Payment-to-bill ratio
-def safe_ratio(pay, bill):
-    if bill > 0:
-        return pay / bill
-    elif pay > 0:
-        return 1.0
-    else:
-        return 0.0
+# 2. Payment-to-bill ratio (vectorized with np.select)
+def safe_ratio(pay_series, bill_series):
+    """Vectorized payment-to-bill ratio with divide-by-zero guard."""
+    conditions = [
+        bill_series > 0,
+        (bill_series <= 0) & (pay_series > 0),
+    ]
+    choices = [
+        pay_series / bill_series,
+        1.0,
+    ]
+    return np.select(conditions, choices, default=0.0)
 
-df['payment_to_bill_ratio'] = [safe_ratio(p, b) for p, b in zip(df['avg_pay_amount'], df['avg_bill_amount'])]
+df['payment_to_bill_ratio'] = safe_ratio(df['avg_pay_amount'], df['avg_bill_amount'])
 df['payment_to_bill_ratio'] = df['payment_to_bill_ratio'].clip(upper=5)
 
 # 3. Delays
@@ -281,17 +285,26 @@ df['credit_utilisation'] = (df['avg_bill_amount'] / df['limit_balance']).clip(lo
 | Line | Code | Plain English | Technical Detail |
 |---|---|---|---|
 | 2 | `df[bill_cols].mean(axis=1)` | Calculate the average across the 6 bill columns for each customer. | `axis=1` means "calculate horizontally across the columns for each row". `axis=0` would calculate the average down the column for all customers. |
-| 6-12 | `def safe_ratio(pay, bill): ...` | Define a custom function to divide payment by bill, with safety checks to prevent crashing if bill is 0. | `def` creates a function. `if/elif/else` handles logic branches. If bill > 0, do normal math. If bill=0 but they paid something, return 1.0 (100% paid). Else return 0. |
-| 14 | `zip(df['avg_pay_amount'], df['avg_bill_amount'])` | Pair up each customer's payment and bill like a zipper. | `zip()` takes two lists and pairs them: `(pay1, bill1), (pay2, bill2), ...` |
-| 14 | `[safe_ratio(p, b) for p, b in zip(...)]` | Run our `safe_ratio` function on every paired payment (`p`) and bill (`b`). | Another list comprehension. It creates a completely new list of calculated ratios. |
-| 15 | `.clip(upper=5)` | Cap the maximum ratio at 5.0. | `.clip()` enforces boundaries. If someone's ratio was 100.0 (because they paid off a tiny 1-dollar bill with 100 dollars), it gets forced down to 5.0 so it doesn't skew our statistics. |
-| 18 | `(df[pay_cols] > 0).sum(axis=1)` | Count how many months the customer was late. | `df > 0` converts the table of numbers into True/False (True if late). `.sum(axis=1)` adds up the Trues horizontally for each customer. |
-| 19 | `df[pay_cols].clip(lower=0).max(axis=1)` | Find the worst single month of delay. | `.clip(lower=0)` changes all negative numbers (paid on time) to 0. `.max(axis=1)` finds the highest number horizontally. |
-| 24 | `df['avg_bill_amount'] / df['limit_balance']` | Divide average bill by credit limit to find utilisation. | Standard pandas vectorised division. It divides row 1 by row 1, row 2 by row 2, extremely fast. |
+| 6 | `def safe_ratio(pay_series, bill_series):` | Define a custom function to divide payment by bill for ALL customers at once. | Unlike the old version that processed one customer at a time, this accepts entire pandas Series (columns) as input and processes all 30,000 rows simultaneously using NumPy vectorization. |
+| 8-11 | `conditions = [...]` | Create a list of True/False masks — one for each business rule. | `bill_series > 0` creates a boolean array of 30,000 True/False values. The `&` operator combines two boolean arrays element-wise. |
+| 12-15 | `choices = [...]` | Create a list of results to use when each condition is True. | `pay_series / bill_series` is vectorized division — it divides all 30,000 rows at once. `1.0` is a scalar that will be broadcast to all matching rows. |
+| 16 | `np.select(conditions, choices, default=0.0)` | Apply the conditions in order: for each row, use the first matching condition's result. | `np.select()` is NumPy's vectorized if/elif/else. It checks `conditions[0]` first. If True, it uses `choices[0]`. If False, it checks `conditions[1]`. If nothing matches, it uses `default=0.0`. This is ~100x faster than a Python for-loop on 30,000 rows. |
+| 18 | `safe_ratio(df['avg_pay_amount'], df['avg_bill_amount'])` | Call the function, passing entire columns at once. | No `zip()` or list comprehension needed — the function handles the whole DataFrame vectorially. |
+| 19 | `.clip(upper=5)` | Cap the maximum ratio at 5.0. | `.clip()` enforces boundaries. If someone's ratio was 100.0 (because they paid off a tiny 1-dollar bill with 100 dollars), it gets forced down to 5.0 so it doesn't skew our statistics. |
+| 22 | `(df[pay_cols] > 0).sum(axis=1)` | Count how many months the customer was late. | `df > 0` converts the table of numbers into True/False (True if late). `.sum(axis=1)` adds up the Trues horizontally for each customer. |
+| 23 | `df[pay_cols].clip(lower=0).max(axis=1)` | Find the worst single month of delay. | `.clip(lower=0)` changes all negative numbers (paid on time) to 0. `.max(axis=1)` finds the highest number horizontally. |
+| 28 | `df['avg_bill_amount'] / df['limit_balance']` | Divide average bill by credit limit to find utilisation. | Standard pandas vectorised division. It divides row 1 by row 1, row 2 by row 2, extremely fast. |
+
+### Key Python Concepts
+- **Vectorization (`np.select`)**: Instead of looping through rows one by one in Python (slow), we tell NumPy to process all 30,000 rows at once using compiled C code (fast). This is the single biggest performance optimization technique in data science.
+- **Broadcasting**: When we write `1.0` as a choice in `np.select`, NumPy automatically "broadcasts" that single number to fill all matching rows. We don't need to create a list of 30,000 ones.
 
 ### 🎤 Viva Q&A
 **Q: What does `axis=1` mean?**
 **A:** In pandas, a DataFrame has two axes. `axis=0` refers to the rows (going downwards vertically). `axis=1` refers to the columns (going horizontally). When we say `mean(axis=1)`, we are telling pandas to calculate the average *across* the columns for a single customer, rather than the average of a column for all customers.
+
+**Q: Why use `np.select()` instead of a for-loop with `zip()`?**
+**A:** A Python for-loop processes one row at a time. For 30,000 rows, Python has to start and stop 30,000 tiny calculations. `np.select()` hands all 30,000 rows to NumPy's C engine in one go, which processes them roughly 100x faster. The business logic (if bill > 0, divide; elif paid > 0, use 1.0; else 0.0) is identical — only the implementation changes from scalar to vectorized.
 
 ---
 
@@ -382,14 +395,51 @@ df['delinquency_score'] = score_dimension(df['delinquency_intensity'], ascending
 
 ---
 
+## 🟢 CELL 56 — Weighted Risk Score (Vectorized UDF)
+
+```python
+def compute_overall_risk_score(data, weights=None):
+    if weights is None:
+        weights = {'delinquency_score': 0.5, 'capacity_score': 0.3, 'exposure_score': 0.2}
+    total_weight = sum(weights.values())
+    weighted_sum = sum(data[dim] * w for dim, w in weights.items())
+    return weighted_sum / total_weight
+
+# Vectorized: operates on entire DataFrame columns at once
+df['overall_risk_score'] = compute_overall_risk_score(df)
+```
+
+### Line-by-Line Breakdown
+| Line | Code | Plain English | Technical Detail |
+|---|---|---|---|
+| 1 | `def compute_overall_risk_score(data, weights=None):` | Define a reusable function that combines the three risk scores into one. | `data` can be a full DataFrame (fast, vectorized) OR a single row Series (reusable for individual scoring). This dual-purpose design satisfies the project spec's UDF requirement. |
+| 3 | `weights = {'delinquency_score': 0.5, ...}` | Default weights: delinquency 50%, capacity 30%, exposure 20%. | These weights reflect the Phase 2 finding that delinquency is the strongest predictor. `0.5 + 0.3 + 0.2 = 1.0`, so the total weight is 1 and the formula simplifies to a weighted average. |
+| 5 | `sum(data[dim] * w for dim, w in weights.items())` | Multiply each score column by its weight, then add them all up. | `weights.items()` yields `('delinquency_score', 0.5), ('capacity_score', 0.3), ...`. When `data` is a DataFrame, `data[dim]` is a full column of 30,000 values, so `data[dim] * w` multiplies all 30,000 at once (vectorized). |
+| 6 | `return weighted_sum / total_weight` | Divide by the total weight to normalise the score. | Since weights sum to 1.0, this is technically dividing by 1.0 (no change). But the division makes the function robust — if someone changes the weights to `(5, 3, 2)`, the result is still correctly normalised. |
+| 9 | `compute_overall_risk_score(df)` | Call the function with the ENTIRE DataFrame (not row-by-row). | Unlike using `df.apply(func, axis=1)` which creates a new Series object 30,000 times (very slow), this passes all columns at once and NumPy/pandas handles the math in compiled C code. |
+
+### Key Python Concepts
+- **Vectorized UDF**: A User-Defined Function that operates on entire columns instead of individual rows. The same `sum(data[dim] * w ...)` expression works on both a DataFrame (vectorized) and a single-row Series (scalar), because pandas overloads the `*` operator for both types.
+- **`df.apply(axis=1)` vs direct column arithmetic**: `df.apply(func, axis=1)` calls `func` once per row — for 30,000 rows, that's 30,000 Python function calls. Direct column arithmetic like `df['col'] * 0.5` runs in a single optimized C operation.
+
+### 🎤 Viva Q&A
+**Q: Why not use `df.apply(compute_overall_risk_score, axis=1)` to call the function?**
+**A:** `df.apply(axis=1)` is one of the slowest operations in pandas. It creates a brand-new Series object for every single row (30,000 times), calls our Python function 30,000 times, and collects the results. By passing the whole DataFrame directly, the `*` and `+` operations happen at the C/NumPy level in one go — roughly 50-100x faster for 30,000 rows.
+
+---
+
 ## 🟢 CELL 58 — Segmentation and Aggregation
 
 ```python
-def assign_segment(score):
-    if score < 2.0: return 'Healthy'
-    elif score < 3.0: return 'Watchlist'
-    elif score < 4.0: return 'At-Risk'
-    else: return 'Critical / Intervention'
+def assign_segment(scores):
+    return pd.cut(
+        scores,
+        bins=[float('-inf'), 2.0, 3.0, 4.0, float('inf')],
+        labels=['Healthy', 'Watchlist', 'At-Risk', 'Critical / Intervention'],
+        right=False
+    )
+
+df['risk_segment'] = assign_segment(df['overall_risk_score'])
 
 segment_summary = df.groupby('risk_segment').agg(
     customers=('id', 'count'),
@@ -401,11 +451,25 @@ segment_summary = df.groupby('risk_segment').agg(
 ### Line-by-Line Breakdown
 | Line | Code | Plain English | Technical Detail |
 |---|---|---|---|
-| 7 | `df.groupby('risk_segment')` | Group the DataFrame into 4 mini-DataFrames, one for each segment. | `.groupby()` is the pandas equivalent of an Excel Pivot Table. |
-| 7 | `.agg(...)` | Calculate multiple summary statistics at once for each group. | `.agg()` (aggregate) lets us specify exactly what math to do on which columns. |
-| 8 | `customers=('id', 'count')` | Create a column called `customers` by counting the `id` column. | This is "Named Aggregation" syntax: `New_Column_Name=('Target_Column', 'Math_Function')`. |
-| 9 | `pct_of_base=('id', lambda x: len(x) / len(df))` | Create a column calculating what percentage of the total dataset this group represents. | Uses a lambda function. `x` is the specific group (e.g. all Healthy IDs). `len(x)` is the count of Healthy. `len(df)` is the total 30,000. |
-| 10 | `default_rate=('default_next_month', 'mean')` | Calculate the default rate by finding the average of the 1s and 0s. | Mean of a boolean/binary column mathematically equals the percentage of 1s. |
+| 1 | `def assign_segment(scores):` | Define a function that converts risk scores into business-friendly segment names. | Takes a pandas Series of scores (all 30,000 at once) instead of a single scalar value. |
+| 2-6 | `pd.cut(scores, bins=[...], labels=[...], right=False)` | Sort all 30,000 scores into 4 named buckets at once. | `pd.cut()` is the vectorized equivalent of an if/elif/else chain. Instead of checking each row one by one, it processes the entire column in a single operation. |
+| 3 | `bins=[float('-inf'), 2.0, 3.0, 4.0, float('inf')]` | Define the bucket boundaries: (-inf, 2.0), [2.0, 3.0), [3.0, 4.0), [4.0, inf). | `float('-inf')` means negative infinity (catches any score, no matter how low). `float('inf')` means positive infinity (catches any score, no matter how high). |
+| 4 | `labels=['Healthy', 'Watchlist', 'At-Risk', 'Critical / Intervention']` | Name each bucket. | 4 labels for 4 intervals. The order must match the bins left to right. |
+| 5 | `right=False` | Make the intervals left-closed: `[2.0, 3.0)` means "2.0 is included, 3.0 is not". | This matches the original `if score < 2.0` logic. A score of exactly 2.0 goes into 'Watchlist', not 'Healthy'. |
+| 8 | `assign_segment(df['overall_risk_score'])` | Call the function with the entire column of 30,000 scores. | No `.apply()` needed — `pd.cut()` handles all rows at once. |
+| 10 | `df.groupby('risk_segment')` | Group the DataFrame into 4 mini-DataFrames, one for each segment. | `.groupby()` is the pandas equivalent of an Excel Pivot Table. |
+| 10 | `.agg(...)` | Calculate multiple summary statistics at once for each group. | `.agg()` (aggregate) lets us specify exactly what math to do on which columns. |
+| 11 | `customers=('id', 'count')` | Create a column called `customers` by counting the `id` column. | This is "Named Aggregation" syntax: `New_Column_Name=('Target_Column', 'Math_Function')`. |
+| 12 | `pct_of_base=('id', lambda x: len(x) / len(df))` | Create a column calculating what percentage of the total dataset this group represents. | Uses a lambda function. `x` is the specific group (e.g. all Healthy IDs). `len(x)` is the count of Healthy. `len(df)` is the total 30,000. |
+| 13 | `default_rate=('default_next_month', 'mean')` | Calculate the default rate by finding the average of the 1s and 0s. | Mean of a boolean/binary column mathematically equals the percentage of 1s. |
+
+### Key Python Concepts
+- **`pd.cut()` vs if/elif/else**: `pd.cut()` is the vectorized way to sort continuous numbers into categories. The old `.apply(assign_segment)` approach called a Python function 30,000 times. `pd.cut()` does the same thing in one compiled operation.
+- **`float('inf')` and `float('-inf')`**: Special Python values meaning infinity and negative infinity. They act as "catch-all" boundaries so no score is accidentally left unassigned.
+
+### 🎤 Viva Q&A
+**Q: Why use `pd.cut()` instead of `if/elif/else` with `.apply()`?**
+**A:** Both produce identical results. The difference is speed. `.apply()` runs a Python function on each of the 30,000 rows individually — 30,000 function calls. `pd.cut()` hands the entire column to pandas' internal C engine, which does all 30,000 comparisons in a single optimized pass. For our dataset the difference is small, but in production systems with millions of rows, vectorized code like `pd.cut()` can be 100x faster.
 
 ---
 
